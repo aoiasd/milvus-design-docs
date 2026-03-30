@@ -1,28 +1,34 @@
-# MEP: Delegator-Side Segment Filtering with PK Predicate Pruning
+# MEP: PK Predicate Segment Pruning in QueryNode
 
 - **Created:** 2026-03-24
 - **Author(s):** @xiaofan-luan
-- **Status:** Draft
+- **Status:** Implemented
 - **Component:** Proxy, QueryNode
 - **Related Issues:** #47804
 - **Released:** TBD
 
 ## Summary
 
-Add a two-stage segment pruning mechanism at the QueryNode delegator level that leverages primary key (PK) predicates in search/query requests to skip irrelevant segments before dispatching work to QueryNode workers. Stage 1 uses PK min/max statistics for range expression pruning; Stage 2 uses bloom filters for PK term/equality pruning. A lightweight proxy-side hint avoids unnecessary plan deserialization when no PK predicate exists.
+Prune sealed segments at the QueryNode segments layer before dispatching C++ search/query calls, by compiling primary-key (PK) predicates from the query plan into a small internal expression IR and evaluating it in batch against per-segment PK statistics (min/max range and bloom filter). A lightweight proxy-side hint avoids unnecessary plan compilation when no PK predicate exists.
 
 ## Motivation
 
-In Milvus, each search or query request is dispatched by the shard delegator to all segments assigned to that shard. For collections with many sealed segments, this can lead to significant unnecessary computation when the query contains PK-based predicates (e.g., `pk in [1, 2, 3]` or `pk > 100`).
+In Milvus, each search or query request is dispatched to all sealed segments that fall within the requested partition/time range. For collections with many sealed segments, this causes significant unnecessary computation when the query contains PK-based predicates (e.g., `pk in [1, 2, 3]` or `pk > 100`).
 
-**Current behavior:** The delegator sends the request to every segment regardless of whether it could possibly contain matching PKs. Bloom filters and PK statistics already exist on each segment for delete deduplication, but they are not leveraged during search/query segment dispatch.
+**Current behavior:** Every sealed segment receives the request. Only inside the C++ expression evaluator does per-row filtering happen, by which point the vector-search kernel has already scanned data that is guaranteed not to contain matching rows.
 
-**Key observation:** Many real-world workloads filter by PK (point lookups, range scans). For these queries, we can use existing per-segment metadata to prune segments at the delegator — before any vector search or data scan occurs. This is especially impactful for:
+**Key observation:** Each sealed segment records its min/max PK range (in the statistics blob) and a bloom filter seeded from all PKs in the segment. Together these can *definitively exclude* a segment before any C++ code is called:
 
-- **Point queries** (`pk = X` or `pk in [list]`): Bloom filters can definitively exclude segments that don't contain the target PKs.
-- **Range queries** (`pk > X`, `pk < Y`): Min/max PK statistics can exclude segments whose PK range doesn't overlap the predicate.
+- **Point queries** (`pk = X` or `pk IN [list]`): Bloom filters can definitively exclude segments that don't contain the target PKs.
+- **Range queries** (`pk > X`, `pk < Y`): Min/max PK statistics can exclude segments whose range doesn't overlap the predicate.
 
-The pruning happens at the delegator (Go layer), avoiding the overhead of dispatching to C++ segcore for segments that provably contain no matching rows.
+The pruning happens in Go before the C++ call, so the segment pinning, context setup, and vector-search kernel are never invoked for pruned segments.
+
+## Non-Goals
+
+- Pruning on non-PK predicates.
+- Filtering growing/streaming segments (their statistics are incomplete).
+- Modifying C++ expression evaluation.
 
 ## Public Interfaces
 
@@ -30,7 +36,7 @@ The pruning happens at the delegator (Go layer), avoiding the overhead of dispat
 
 | Parameter | Key | Default | Description |
 |-----------|-----|---------|-------------|
-| `EnableSegmentFilter` | `queryNode.enableSegmentFilter` | `true` | Enable delegator-side segment filtering using PK predicates (min/max + bloom filter) |
+| `EnableSegmentFilter` | `queryNode.enableSegmentFilter` | `true` | Enable segments-layer PK predicate pruning (min/max + bloom filter) |
 
 ### Proto Changes
 
@@ -39,7 +45,7 @@ The pruning happens at the delegator (Go layer), avoiding the overhead of dispat
 ```protobuf
 message SearchRequest {
     // ... existing fields ...
-    int32 pk_filter = N;  // Proxy-set hint: 0 = unknown, 1 = no PK predicate, 2 = has PK predicate
+    int32 pk_filter = N;  // Proxy-set hint: 0=not checked, 1=has PK predicate, 2=no PK predicate
 }
 
 message RetrieveRequest {
@@ -52,9 +58,9 @@ message RetrieveRequest {
 
 ```go
 const (
-    PkFilterUnknown    = int32(0) // Not analyzed (backward compat with old proxies)
-    PkFilterNoPkFilter = int32(1) // Proxy confirmed no optimizable PK predicate
-    PkFilterHasPkFilter = int32(2) // Proxy confirmed optimizable PK predicate exists
+    PkFilterNotChecked  = int32(0) // Proxy did not analyse the plan (backward compat)
+    PkFilterHasPkFilter = int32(1) // Proxy confirmed optimisable PK predicate exists
+    PkFilterNoPkFilter  = int32(2) // Proxy confirmed no optimisable PK predicate
 )
 ```
 
@@ -62,135 +68,173 @@ const (
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `milvus_querynode_segment_filter_hit_segment_num` | Histogram | nodeID, collectionID, queryType | Number of segments with bloom filter hits (not pruned) |
-| `milvus_querynode_segment_filter_skipped_segment_num` | Histogram | nodeID, collectionID, queryType | Number of segments pruned by the filter |
+| `milvus_querynode_segment_filter_total_segment_num` | Histogram | nodeID, collectionID, queryType | Total sealed segments considered |
+| `milvus_querynode_segment_filter_skipped_segment_num` | Histogram | nodeID, collectionID, queryType | Segments pruned by PK filter |
+| `milvus_querynode_segment_filter_hit_segment_num` | Histogram | nodeID, collectionID, queryType | Segments that passed the filter |
 
 ## Design Details
 
 ### Architecture Overview
 
 ```
-┌─────────┐     ┌────────────────────┐     ┌──────────────────────┐
-│  Proxy  │────▶│ Shard Delegator    │────▶│  QueryNode Workers   │
-│         │     │                    │     │                      │
-│ Analyze │     │ Stage 0: Hint      │     │  (only receives      │
-│ plan,   │     │ Stage 1: Min/Max   │     │   non-pruned         │
-│ set     │     │ Stage 2: Bloom     │     │   segments)          │
-│ PkFilter│     │ Filter segments    │     │                      │
-└─────────┘     └────────────────────┘     └──────────────────────┘
+┌─────────┐     ┌────────────────────┐     ┌──────────────────────────────────┐
+│  Proxy  │────▶│  Shard Delegator   │────▶│  QueryNode Worker                │
+│         │     │                    │     │                                  │
+│ Analyze │     │ Forward PkFilter   │     │  validateOnHistorical()          │
+│ plan,   │     │ hint to workers    │     │  ├─ buildSegmentFilterExprFrom   │
+│ set     │     │ (no filtering      │     │  │   Plan(plan, pkFilter) → IR   │
+│ PkFilter│     │  here)             │     │  ├─ checkSegmentFilter(IR, segs) │
+│  hint   │     │                    │     │  │   ├─ min/max range check      │
+└─────────┘     └────────────────────┘     │  │   └─ bloom filter check      │
+                                           │  └─ unpin skipped segments       │
+                                           └──────────────────────────────────┘
 ```
 
-### Stage 0: Proxy-Side Hint (Avoid Unnecessary Unmarshal)
+### Proxy-Side Hint
 
-The proxy analyzes the query plan at compile time and sets the `PkFilter` hint field:
+`HasOptimizablePkPredicate(plan)` in `internal/util/exprutil/expr_checker.go` walks the expression tree and returns `true` when the root expression is:
 
-- **`PkFilterNoPkFilter` (1):** No PK predicate found → delegator skips all filtering (no plan unmarshal needed).
-- **`PkFilterHasPkFilter` (2):** Optimizable PK predicate found → delegator proceeds with filtering.
-- **`PkFilterUnknown` (0):** Old proxy or mixed-version rolling upgrade → delegator falls back to attempting unmarshal.
+- `pk = x` (UnaryRangeExpr with EQ op)
+- `pk IN [x₁, …]` (TermExpr on PK field)
+- `lo < pk < hi` (BinaryRangeExpr on PK field)
+- `AND` of any of the above
 
-The proxy walks the expression tree looking for PK predicates (TermExpr, UnaryRangeExpr) and handles logical operators:
-- `AND(pk_pred, other)` → optimizable
-- `OR(pk_pred, non_pk_pred)` → **not** optimizable (non-PK side is unconstrained)
-- `NOT(pk_pred)` → **not** optimizable (negation invalidates pruning)
+Before dispatching, the proxy sets `PkFilter` on the request:
 
-This avoids the cost of `proto.Unmarshal` on the delegator for the majority of queries that don't filter by PK.
+- **`PkFilterHasPkFilter` (1):** Optimisable PK predicate found → worker compiles and applies the IR.
+- **`PkFilterNoPkFilter` (2):** No PK predicate → worker skips IR compilation entirely.
+- **`PkFilterNotChecked` (0):** Old proxy / rolling upgrade → worker attempts compilation anyway.
 
-### Stage 1: Min/Max Pruning (Range Expressions)
+This avoids the cost of plan compilation on the worker for the majority of queries that have no PK predicate.
 
-For PK range predicates (`pk > X`, `pk < Y`, `pk >= X`, `pk <= Y`, `pk = X`), the delegator checks each sealed segment's PK min/max statistics:
+### Delegator: Hint Forwarding
 
-- If the segment's `[minPK, maxPK]` range is entirely outside the predicate range, the segment is skipped.
-- Conjunction (`AND`) of multiple range predicates is evaluated conjunctively — a segment must satisfy all conditions to survive.
-- Disjunction (`OR`) and other complex expressions are treated conservatively (segment kept).
+The delegator does **not** filter segments. It only forwards the `PkFilter` hint when fan-out sub-requests are constructed via `shallowCopySearchRequest` / `shallowCopyRetrieveRequest`, so the worker shard that owns the sealed segments receives the hint.
 
-**Only sealed segments** are pruned. Growing segments are excluded because:
-1. Their min/max stats are mutable (concurrent inserts).
-2. Growing segments are typically small, so the pruning benefit is minimal.
+### Segment Filter IR
 
-### Stage 2: Bloom Filter Pruning (Term/Equality Expressions)
+`internal/querynodev2/segments/segment_filter.go` defines a small internal expression tree compiled once per request:
 
-For PK point predicates (`pk IN [values]` or `pk = value`), the delegator uses per-segment bloom filters:
+```
+segmentFilterExpr
+  ├── segmentFilterTermExpr           pk IN [v₁, v₂, …]
+  ├── segmentFilterUnaryRangeExpr     pk op value
+  ├── segmentFilterBinaryRangeExpr    lo (< / <=) pk (< / <=) hi
+  ├── segmentFilterLogicalExpr        AND / OR of sub-expressions
+  └── segmentFilterUnsupportedExpr    fallback — no pruning (keep all)
+```
 
-1. **Extract PK constraint:** Walk the expression tree to collect the set of PK values, handling:
-   - `TermExpr(pk, [v1, v2, ...])` → PK in set
-   - `UnaryRangeExpr(pk, Equal, v)` → PK = v (treated as single-element set)
-   - `AND(left, right)` → intersection of PK sets
-   - `OR(left, right)` → union of PK sets (only if both sides have PK constraints)
-   - `NOT(inner)` → PK constraint from inner is ignored (conservative)
+**Building:** `buildSegmentFilterExprFromPlan(plan, pkFilter)` returns `nil` immediately when `pkFilter == PkFilterNoPkFilter`. Otherwise it calls `extractSegmentFilterPredicates(plan)` to walk the plan and `buildSegmentFilterExpr(predicates)` to compile into the IR.
 
-2. **Batch bloom filter check:** For each sealed segment, test all extracted PK values against the segment's bloom filter.
+**Evaluating:** `checkSegmentFilter(expr, segments)` tests each sealed segment against the IR and returns a `segmentMatchSet`:
 
-3. **Pruning decision:** If **no** PK value has a bloom filter hit for a segment, the segment is skipped (bloom filters have no false negatives for membership testing).
+- `{all: true}` — keep all segments (used for unsupported expressions as conservative fallback).
+- `{ids: Set[int64]}` — the explicit set of segment IDs that passed.
 
-### Partition Filtering
+Per-node evaluation:
 
-Before PK pruning, segments are also filtered by requested partitions. This is a simple set membership check that reduces the number of segments entering the PK pruning stages.
+| Node type | Logic |
+|---|---|
+| `TermExpr` | For each value, check `[segMin, segMax]` inclusion; if in range probe bloom filter via `BatchPkExist`. Segment matches if any value passes both. |
+| `UnaryRangeExpr` | Boundary arithmetic on segment min/max PK. |
+| `BinaryRangeExpr` | Both lower and upper bound arithmetic on segment min/max PK. |
+| `AND` | Evaluate left; **short-circuit** return empty set if left is already empty. Intersect with right otherwise. |
+| `OR` | Evaluate left; **short-circuit** return `all` if left is already `all`. Union with right otherwise. |
+| `Unsupported` | Return `{all: true}` — segment kept. |
+
+### Validate Layer
+
+`validateOnHistorical` in `internal/querynodev2/segments/validate.go`:
+
+1. Calls `validate(...)` to pin all candidate sealed segments.
+2. If `queryNode.enableSegmentFilter = true` **and** the compiled `expr != nil`:
+   - Calls `checkSegmentFilter(expr, segments)`.
+   - Unpins skipped segments immediately so their resources are released.
+3. Records the three Prometheus histograms.
+
+`validateOnStream` ignores the expression entirely — growing segments are always queried.
+
+### Search and Retrieve Entrypoints
+
+| Function | Applies filter? | Notes |
+|---|---|---|
+| `SearchHistorical` | Yes | `buildSegmentFilterExprFromPlan(plan, searchReq.PkFilter())` |
+| `SearchStreaming` | No | Does not accept a plan node |
+| `Retrieve` (historical scope) | Yes | Same builder, inside `DataScope_Historical` branch |
+| `Retrieve` / `RetrieveStream` (streaming scope) | No | `nil` passed to `validateOnStream` |
+
+The IR is compiled **once** in Go before any C++ call, so compilation cost is O(1) regardless of segment count.
 
 ### Data Flow
 
 ```
 Search/Query Request
 │
-├── Proxy: computeSegmentFilter(plan) → set PkFilter hint
+├── Proxy: HasOptimizablePkPredicate(plan) → set PkFilter hint
 │
-├── Delegator: buildAndApplySegmentFilters()
-│   ├── Check EnableSegmentFilter config flag
-│   ├── Check PkFilter hint (early exit if NoPkFilter)
-│   ├── proto.Unmarshal(serializedPlan)
-│   ├── Filter segments by partitions
-│   ├── Stage 1: buildSkippedSegmentsByPredicates() [min/max]
-│   │   └── evalExprWithCandidate() for each sealed segment
-│   ├── Stage 2: buildSegmentFilterFromPredicates() [bloom filter]
-│   │   ├── extractPkConstraint() → pkConstraint{dataType, values}
-│   │   ├── BatchGetFromSealedSegments() → per-segment BF hit results
-│   │   └── Segments with no BF hits → skipped
-│   └── Report metrics
+├── Delegator: shallowCopySearchRequest / shallowCopyRetrieveRequest
+│   └── Forward PkFilter to worker sub-requests
 │
-└── Dispatch to QueryNode workers (pruned segment lists)
+└── QueryNode Worker: SearchHistorical / Retrieve
+    ├── buildSegmentFilterExprFromPlan(plan, pkFilter)
+    │   ├── Return nil immediately if pkFilter == PkFilterNoPkFilter
+    │   └── Otherwise compile plan predicates → IR
+    ├── validateOnHistorical(ctx, manager, ..., expr)
+    │   ├── Pin all candidate sealed segments
+    │   ├── checkSegmentFilter(expr, segments) → segmentMatchSet
+    │   │   ├── For each segment:
+    │   │   │   ├── TermExpr: range check + BatchPkExist bloom filter
+    │   │   │   ├── UnaryRangeExpr: boundary arithmetic
+    │   │   │   └── BinaryRangeExpr: lower + upper boundary arithmetic
+    │   │   ├── AND: intersect (short-circuit on empty)
+    │   │   └── OR: union (short-circuit on all)
+    │   ├── Unpin skipped segments
+    │   └── Record metrics (total / skipped / hit)
+    └── searchSegments / retrieveSegments (C++ calls, filtered set only)
 ```
 
 ### Correctness Guarantees
 
-- **No false negatives:** Bloom filter testing is safe — a negative result guarantees the PK is not in the segment. Only positive results may be false positives (segment is kept when it might not need to be).
-- **Min/max is conservative:** If min/max stats are unavailable, the segment is kept.
-- **Growing segments untouched:** Growing segment lists are never pruned by PK, avoiding races with concurrent inserts.
-- **Empty intersection:** If AND produces an empty PK set (impossible predicate), all sealed segments are skipped — the query will return empty results as expected.
+- **No false negatives:** Bloom filter testing only produces false positives (a segment may be kept when it doesn't need to be), never false negatives. The min/max range check is exact. A segment is only skipped when it is *proven* not to contain a matching PK.
+- **Min/max is conservative:** If statistics are unavailable, the segment is kept.
+- **Growing segments untouched:** Growing segments are never pruned. Their statistics are updated asynchronously and may be incomplete.
+- **Unsupported expressions:** Any expression that cannot be compiled into the IR becomes `segmentFilterUnsupportedExpr` → `{all: true}` → all segments kept.
+- **Empty TermExpr:** `pk IN []` (impossible predicate) correctly evaluates to the empty match set, pruning all sealed segments.
 
 ## Compatibility, Deprecation, and Migration Plan
 
-- **Rolling upgrade safe:** The `PkFilter` field defaults to `0` (Unknown). Old proxies that don't set the hint will cause the delegator to attempt unmarshal and analyze on its own. New proxies with old delegators simply have the hint field ignored.
-- **Feature flag:** `queryNode.enableSegmentFilter` defaults to `true` but can be disabled at runtime if issues arise.
-- **No API changes:** This is purely an internal optimization. External search/query APIs are unchanged.
+- **Rolling upgrade safe:** `PkFilter` defaults to `0` (NotChecked). Old proxies that don't set the hint cause the worker to attempt IR compilation anyway — no pruning regression, just slightly more work.
+- **Feature flag:** `queryNode.enableSegmentFilter` defaults to `true` but can be disabled at runtime.
+- **No API changes:** Purely an internal optimisation. External search/query APIs are unchanged.
 
 ## Test Plan
 
-- **Unit tests:** `segment_filter_test.go` covers:
-  - PK constraint extraction for all expression types (Term, Equal, AND, OR, NOT, nested combinations)
-  - Bloom filter pruning with multiple segments and PK values
-  - Min/max range pruning for all comparison operators
-  - Partition filtering
-  - Edge cases: nil plans, empty predicates, unsupported types, offline segments
-  - End-to-end `buildAndApplySegmentFilters` with config flag toggling
-- **Proxy-side tests:** `task_search_pk_hint_test.go` covers `computeSegmentFilter()` for all plan types.
-- **Benchmark tests:** `segment_filter_bench_test.go` measures proto marshal/unmarshal overhead for plans with 2000 PKs.
-- **E2E:** Existing search/query integration tests ensure correctness is preserved — the optimization only affects which segments are scanned, not results.
+- **Unit tests** (`segment_filter_test.go`): IR evaluation for all node types — Term, UnaryRange, BinaryRange, AND, OR; edge cases (empty Term, unsupported expr, nil plan); AND/OR short-circuit paths.
+- **Validate-layer tests** (`validate_test.go`): `validateOnHistorical` unpins skipped segments; does not filter when expr is nil; does not filter when `enableSegmentFilter=false`; metric observation.
+- **Integration tests** (`search_test.go`, `retrieve_test.go`): End-to-end `SearchHistorical` and `Retrieve` with real segments and bloom filters loaded — verify correct number of segments scanned.
+- **Proxy-side tests** (`task_search_pk_hint_test.go`): `HasOptimizablePkPredicate` for all plan types.
+- **E2E:** Existing search/query integration tests ensure result correctness is preserved.
 
 ## Rejected Alternatives
 
-### Pass PK Values from Proxy to Delegator via Proto
+### Delegator-Side Filtering
 
-An earlier design considered having the proxy extract PK values and pass them explicitly in the SearchRequest/QueryRequest proto (via a `SegmentPkHint` message). This was rejected because:
-- It duplicates data already in the serialized plan, increasing message size.
-- For large IN-lists (thousands of PKs), the overhead of serializing PK values twice is wasteful.
-- The delegator already needs to unmarshal the plan for other purposes in some code paths.
+An earlier design applied bloom-filter and min/max checks inside the shard delegator before routing sub-requests to worker nodes. This was rejected because:
 
-### Prune Growing Segments Too
+- The delegator does not pin or own sealed segments — filtering there would require an extra metadata lookup or cache layer.
+- Applying filtering in the segments layer (where segments are already pinned) is simpler and covers both the delegator-routed and direct-query code paths from a single implementation point.
+- The dominant cost being saved is the C++ vector-search kernel per segment. Filtering at the segments layer — just before the C++ call — achieves the same saving without adding delegator complexity.
+
+### Pass PK Values from Proxy via Proto
+
+An earlier design considered having the proxy extract PK values and pass them explicitly in the request proto. This was rejected because:
+- It duplicates data already in the serialised plan, increasing message size.
+- For large IN-lists the overhead of serialising PK values twice is wasteful.
+- The hint field (PkFilter) achieves the avoidance of plan compilation at negligible cost.
+
+### Prune Growing Segments
 
 Growing segments have bloom filters and PK statistics, but they are mutable under concurrent inserts. Pruning them would require either locking (latency cost) or accepting race conditions (correctness risk). Since growing segments are typically small, the benefit doesn't justify the complexity.
-
-### Always Unmarshal Plan at Delegator
-
-Without the proxy hint, the delegator would unmarshal every query plan to check for PK predicates. Benchmarks showed this adds ~20-50µs per request even for plans with no PK predicate. The hint avoids this overhead for the common case.
 
 ## References
 
